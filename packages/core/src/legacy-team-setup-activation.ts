@@ -90,6 +90,10 @@ export interface FinishLegacyTeamSetupActivationInput
 	 * Implementations must be synchronous and read from the same database.
 	 */
 	validateLockedPreview: (preview: LegacyTeamSetupActivationPreviewV1) => boolean;
+	canonicalCompletion?: {
+		policyRevision: string;
+		completedAt: string;
+	};
 	now?: string;
 }
 
@@ -136,6 +140,7 @@ interface TeamRow {
 	display_name: string;
 	status: string;
 	device_eligibility_mode: string;
+	migration_state: string;
 	provenance: string;
 	source_fingerprint: string | null;
 }
@@ -369,7 +374,14 @@ function droppedSetupMappings(model: ActivationModel): MappingRow[] {
 	);
 }
 
-function loadModel(db: Database, input: PreviewLegacyTeamSetupActivationInput): ActivationModel {
+function loadModel(
+	db: Database,
+	input: PreviewLegacyTeamSetupActivationInput & {
+		allowCompletedDraft?: boolean;
+		allowInactiveCanonicalTeam?: boolean;
+		allowStaleDraft?: boolean;
+	},
+): ActivationModel {
 	const draft = db
 		.prepare(
 			`SELECT draft.attempt_id, draft.candidate_id, draft.coordinator_id, draft.group_id,
@@ -385,7 +397,13 @@ function loadModel(db: Database, input: PreviewLegacyTeamSetupActivationInput): 
 	if (!draft || draft.candidate_id !== input.candidateRef) {
 		activationError("team_setup_confirmation_stale");
 	}
-	if (draft.is_current === 0 || (draft.state !== "needs_setup" && draft.state !== "in_progress")) {
+	if (
+		draft.is_current === 0 ||
+		(draft.state !== "needs_setup" &&
+			draft.state !== "in_progress" &&
+			!(input.allowCompletedDraft && draft.state === "completed") &&
+			!(input.allowStaleDraft && draft.state === "stale"))
+	) {
 		activationError("team_setup_confirmation_stale");
 	}
 
@@ -474,7 +492,7 @@ function loadModel(db: Database, input: PreviewLegacyTeamSetupActivationInput): 
 		(db
 			.prepare(
 				`SELECT team_id, display_name, status, device_eligibility_mode,
-				        provenance, source_fingerprint
+				        migration_state, provenance, source_fingerprint
 				 FROM policy_teams WHERE team_id = ?`,
 			)
 			.get(teamId) as TeamRow | undefined) ?? null;
@@ -557,15 +575,23 @@ function loadModel(db: Database, input: PreviewLegacyTeamSetupActivationInput): 
 			.toSorted(compareText),
 	};
 	validateAssignmentExpectations(model);
-	validateCanonicalState(db, model);
+	validateCanonicalState(db, model, input.allowInactiveCanonicalTeam === true);
 	return model;
 }
 
-function validateCanonicalState(db: Database, model: ActivationModel): void {
+function validateCanonicalState(
+	db: Database,
+	model: ActivationModel,
+	allowInactiveCanonicalTeam: boolean,
+): void {
 	const { groupScopeIds, memberships, projects, recipients, scopeIds, team, teamId } = model;
 	if (team) {
 		const baseCompatible =
-			team.status === "active" && team.provenance === HISTORICAL_TEAM_PROVENANCE;
+			(team.status === "active" ||
+				(allowInactiveCanonicalTeam &&
+					team.status === "inactive" &&
+					team.migration_state === "needs_setup")) &&
+			team.provenance === HISTORICAL_TEAM_PROVENANCE;
 		const reviewedCompatible = team.device_eligibility_mode === "reviewed_allowlist";
 		const historicalCompatible = team.device_eligibility_mode === "person_all_devices";
 		if (!baseCompatible || (!reviewedCompatible && !historicalCompatible)) {
@@ -775,6 +801,23 @@ interface DerivationRows {
 	}>;
 }
 
+const LEGACY_TEAM_SETUP_MAX_ACCESS_DELTA_ENTRIES = 10_000;
+
+export function requireLegacyTeamSetupAccessDeltaWithinLimit(
+	delta: LegacyTeamSetupAccessDeltaV1,
+): void {
+	const counts = [
+		delta.teamChanges.length,
+		delta.membershipChanges.length,
+		delta.projectChanges.length,
+		delta.recipientChanges.length,
+		delta.deviceAccessChanges.length,
+	];
+	if (counts.some((count) => count > LEGACY_TEAM_SETUP_MAX_ACCESS_DELTA_ENTRIES)) {
+		throw new Error("legacy_team_setup_roster_too_large");
+	}
+}
+
 function currentDerivationRows(model: ActivationModel): DerivationRows {
 	return {
 		identities: model.identities.map((row) => ({
@@ -956,8 +999,9 @@ function simulatedDerivationRows(model: ActivationModel): DerivationRows {
 				row.recipientKind === "team" &&
 				row.recipientId === model.teamId,
 		);
-		if (existing) existing.status = "active";
-		else {
+		if (existing) {
+			if (existing.provenance === "reviewed_team_setup") existing.status = "active";
+		} else {
 			projectRecipients.push({
 				canonicalProjectIdentity: resolvedIdentity,
 				recipientKind: "team",
@@ -1103,7 +1147,7 @@ function buildAccessDelta(model: ActivationModel): LegacyTeamSetupAccessDeltaV1 
 				row.canonical_project_identity === resolvedIdentity &&
 				row.recipient_kind === "team" &&
 				row.recipient_id === model.teamId &&
-				row.status === "active",
+				(row.status === "active" || row.provenance !== "reviewed_team_setup"),
 		);
 		if (!recipient && !plannedRecipientIdentities.has(resolvedIdentity)) {
 			plannedRecipientIdentities.add(resolvedIdentity);
@@ -1276,9 +1320,19 @@ function exactReplay(
 ): LegacyTeamSetupActivationResultV1 | null {
 	const row = db
 		.prepare(
-			`SELECT response_json FROM legacy_team_setup_completions
-			 WHERE candidate_ref = ? AND attempt_id = ? AND finish_digest = ?
-			   AND confirmed_access_delta_digest = ?`,
+			`SELECT completion.response_json
+			 FROM legacy_team_setup_completions AS completion
+			 JOIN legacy_team_setup_drafts AS draft
+			   ON draft.attempt_id = completion.attempt_id
+			  AND draft.candidate_id = completion.candidate_ref
+			  AND draft.finish_digest = completion.finish_digest
+			 WHERE completion.candidate_ref = ? AND completion.attempt_id = ?
+			   AND completion.finish_digest = ?
+			   AND completion.confirmed_access_delta_digest = ?
+			   AND NOT EXISTS (
+			     SELECT 1 FROM legacy_team_setup_drafts AS newer
+			     WHERE newer.candidate_id = draft.candidate_id AND newer.rowid > draft.rowid
+			   )`,
 		)
 		.get(
 			input.candidateRef,
@@ -1287,6 +1341,16 @@ function exactReplay(
 			input.confirmedAccessDeltaDigest,
 		) as CompletionRow | undefined;
 	return row ? (JSON.parse(row.response_json) as LegacyTeamSetupActivationResultV1) : null;
+}
+
+export function replayLegacyTeamSetupActivation(
+	db: Database,
+	input: Pick<
+		FinishLegacyTeamSetupActivationInput,
+		"candidateRef" | "attemptId" | "finishDigest" | "confirmedAccessDeltaDigest"
+	>,
+): LegacyTeamSetupActivationResultV1 | null {
+	return exactReplay(db, input);
 }
 
 function validateFreshRoster(
@@ -1319,17 +1383,41 @@ function validateFreshRoster(
 	}
 }
 
+export function inspectFreshLegacyTeamSetupActivation(
+	db: Database,
+	input: PreviewLegacyTeamSetupActivationInput & {
+		freshRoster: Awaited<ReturnType<FinishLegacyTeamSetupActivationInput["loadFreshRoster"]>>;
+		projectInventory: LegacyTeamSetupProjectInput[];
+	},
+): LegacyTeamSetupActivationPreviewV1 {
+	try {
+		const model = loadModel(db, input);
+		validateFreshRoster(model, input.freshRoster);
+		if (
+			legacyTeamProjectionFingerprint(input.projectInventory) !== model.draft.projection_fingerprint
+		) {
+			activationError("team_setup_projection_changed");
+		}
+		return buildPreview(model);
+	} catch (error) {
+		const normalized = normalizedActivationError(error);
+		persistSafeError(db, input, normalized);
+		throw normalized;
+	}
+}
+
 function applyActivation(
 	db: Database,
 	model: ActivationModel,
 	preview: LegacyTeamSetupActivationPreviewV1,
 	freshRoster: Awaited<ReturnType<FinishLegacyTeamSetupActivationInput["loadFreshRoster"]>>,
 	now: string,
+	revisionOverride?: string,
+	allowExistingCompletion = false,
 ): LegacyTeamSetupActivationResultV1 {
-	const revision = recipientPolicyDigest(
-		"legacy-team-activation-revision-v1",
-		preview.finishDigest,
-	);
+	const revision =
+		revisionOverride ??
+		recipientPolicyDigest("legacy-team-activation-revision-v1", preview.finishDigest);
 	if (!model.team) {
 		db.prepare(
 			`INSERT INTO policy_teams(
@@ -1570,7 +1658,10 @@ function applyActivation(
 			 created_at, updated_at
 			 ) VALUES (?, 'team', ?, 'active', 'reviewed_team_setup', ?, 'completed', ?, ?, ?, ?)
 			 ON CONFLICT(canonical_project_identity, recipient_kind, recipient_id) DO UPDATE SET
-			 status = 'active',
+			 status = CASE
+			   WHEN project_recipients.provenance = 'reviewed_team_setup' THEN 'active'
+			   ELSE project_recipients.status
+			 END,
 			 provenance = CASE
 			   WHEN project_recipients.provenance = 'reviewed_team_setup' THEN excluded.provenance
 			   ELSE project_recipients.provenance
@@ -1693,12 +1784,7 @@ function applyActivation(
 		now,
 		model.draft.attempt_id,
 	);
-	db.prepare(
-		`INSERT INTO legacy_team_setup_completions(
-		 attempt_id, finish_digest, candidate_ref, confirmed_access_delta_digest,
-		 completed_team_id, response_json, completed_at, created_at
-		 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-	).run(
+	const completionValues = [
 		model.draft.attempt_id,
 		preview.finishDigest,
 		model.draft.candidate_id,
@@ -1707,8 +1793,84 @@ function applyActivation(
 		JSON.stringify(result),
 		now,
 		now,
-	);
+	] as const;
+	const insertedCompletion = db
+		.prepare(
+			`INSERT ${allowExistingCompletion ? "OR IGNORE " : ""}INTO legacy_team_setup_completions(
+		 attempt_id, finish_digest, candidate_ref, confirmed_access_delta_digest,
+		 completed_team_id, response_json, completed_at, created_at
+		 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		)
+		.run(...completionValues);
+	if (allowExistingCompletion && insertedCompletion.changes === 0) {
+		const existing = db
+			.prepare(
+				`SELECT candidate_ref, confirmed_access_delta_digest, completed_team_id,
+				        response_json, completed_at
+				 FROM legacy_team_setup_completions
+				 WHERE attempt_id = ? AND finish_digest = ?`,
+			)
+			.get(model.draft.attempt_id, preview.finishDigest) as
+			| {
+					candidate_ref: string;
+					confirmed_access_delta_digest: string;
+					completed_team_id: string;
+					response_json: string;
+					completed_at: string;
+			  }
+			| undefined;
+		if (
+			!existing ||
+			existing.candidate_ref !== model.draft.candidate_id ||
+			existing.confirmed_access_delta_digest !== preview.accessDeltaDigest ||
+			existing.completed_team_id !== model.teamId ||
+			existing.response_json !== JSON.stringify(result) ||
+			existing.completed_at !== now
+		) {
+			activationError("team_setup_completion_invalid");
+		}
+	}
 	return result;
+}
+
+/**
+ * Applies coordinator-owned completion facts after the caller has rewritten the
+ * current draft to match a validated manifest. The caller owns serialization
+ * and the surrounding immediate transaction.
+ */
+export function applyCanonicalLegacyTeamSetupActivationInTransaction(
+	db: Database,
+	input: PreviewLegacyTeamSetupActivationInput & {
+		policyRevision: string;
+		completedAt: string;
+		allowCompletedDraft?: boolean;
+		allowStaleDraft?: boolean;
+	},
+): LegacyTeamSetupActivationResultV1 {
+	try {
+		const model = loadModel(db, { ...input, allowInactiveCanonicalTeam: true });
+		const inspected = buildPreview(model);
+		requireLegacyTeamSetupAccessDeltaWithinLimit(inspected.accessDelta);
+		const roster = model.devices
+			.filter((device) => device.decision !== "removed")
+			.map((device) => ({
+				deviceId: device.device_id,
+				fingerprint: device.key_fingerprint,
+				displayName: device.display_name,
+				enabled: device.enabled !== 0,
+			}));
+		return applyActivation(
+			db,
+			model,
+			inspected,
+			roster,
+			input.completedAt,
+			input.policyRevision,
+			true,
+		);
+	} catch (error) {
+		throw normalizedActivationError(error);
+	}
 }
 
 export async function finishLegacyTeamSetupActivation(
@@ -1788,7 +1950,14 @@ export async function finishLegacyTeamSetupActivation(
 						if (!input.validateLockedPreview(lockedPreview)) {
 							activationError("team_setup_confirmation_stale");
 						}
-						return applyActivation(db, model, lockedPreview, freshRoster, now);
+						return applyActivation(
+							db,
+							model,
+							lockedPreview,
+							freshRoster,
+							input.canonicalCompletion?.completedAt ?? now,
+							input.canonicalCompletion?.policyRevision,
+						);
 					})
 					.immediate();
 			} catch (error) {

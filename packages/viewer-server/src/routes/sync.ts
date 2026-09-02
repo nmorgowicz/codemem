@@ -45,6 +45,7 @@ import {
 	buildDirectPeerAuthHeaders,
 	CoordinatorReciprocalApprovalRequestChangedError,
 	canonicalWorkspaceIdentity,
+	claimRecipientPolicyActorMutations,
 	cleanupNonces,
 	commitDeviceIdentityBindings,
 	commitRecipientPolicyEdges,
@@ -130,6 +131,7 @@ import {
 	normalizeTeammateName,
 	parseAcceptedProjectIntent,
 	parseReassignScopePayload,
+	parseRecipientPolicyEdgeCommitRequest,
 	parseSyncScopeRequest,
 	persistShareOperation,
 	personalScopeGrantStatusForPeer,
@@ -165,6 +167,7 @@ import {
 	SYNC_FEATURES_HEADER,
 	SYNC_SCOPE_QUERY_PARAM,
 	schema,
+	serializeRecipientPolicyTeamMutation,
 	summarizeInboundScopeRejections,
 	supportsSyncFeature,
 	syncScopeResetRequiredPayload,
@@ -5842,7 +5845,27 @@ export function syncRoutes(
 		const store = getStore();
 		const body = await parseViewerJsonBody(c);
 		try {
-			const result = commitRecipientPolicyEdges(store.db, body);
+			const request = parseRecipientPolicyEdgeCommitRequest(body);
+			// Acquire every affected Team queue in one stable order. Finish publication
+			// uses the same Team boundary, so its reviewed snapshot cannot race a
+			// successful user recipient commit.
+			const teamIds = request
+				? [
+						...new Set(
+							request.changes.flatMap((change) =>
+								change.recipient.recipientKind === "team" ? [change.recipient.teamId] : [],
+							),
+						),
+					].toSorted()
+				: [];
+			const commit = async (
+				index: number,
+			): Promise<ReturnType<typeof commitRecipientPolicyEdges>> => {
+				const teamId = teamIds[index];
+				if (!teamId) return commitRecipientPolicyEdges(store.db, request ?? body);
+				return serializeRecipientPolicyTeamMutation(store.db, teamId, () => commit(index + 1));
+			};
+			const result = await commit(0);
 			if (result.status === "invalid") return c.json(result, 400);
 			if (result.status === "not_found") return c.json(result, 404);
 			if (result.status === "stale" || result.status === "conflict") {
@@ -6701,6 +6724,13 @@ export function syncRoutes(
 		if (!secondaryActorId) return c.json({ error: "secondary_actor_id required" }, 400);
 		if (primaryActorId === secondaryActorId) return c.json({ error: "actor ids must differ" }, 400);
 		const d = drizzle(store.db, { schema });
+		const releaseActorMutations = await claimRecipientPolicyActorMutations(store.db, [
+			primaryActorId,
+			secondaryActorId,
+		]);
+		// This transaction is synchronous. Deferring release prevents a thrown transaction
+		// from leaking the lock while keeping it held through every mutation below.
+		queueMicrotask(releaseActorMutations);
 		const now = new Date().toISOString();
 		const result = store.db
 			.transaction(() => {
@@ -7027,6 +7057,9 @@ export function syncRoutes(
 		if (actorId === store.actorId) {
 			return c.json({ error: "cannot deactivate this device's own local actor" }, 409);
 		}
+		const releaseActorMutations = await claimRecipientPolicyActorMutations(store.db, [actorId]);
+		// All following reads and writes are synchronous, so release after this turn.
+		queueMicrotask(releaseActorMutations);
 		const d = drizzle(store.db, { schema });
 		const actor = d.select().from(schema.actors).where(eq(schema.actors.actor_id, actorId)).get();
 		if (!actor) return c.json({ error: "actor not found" }, 404);
