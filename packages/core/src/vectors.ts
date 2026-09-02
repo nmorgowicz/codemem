@@ -26,10 +26,16 @@ import type { ReplicationVectorWork } from "./sync-replication.js";
 import type { MemoryFilters } from "./types.js";
 
 const VECTOR_MODEL_MIGRATION_JOB = "vector_model_migration";
+const BACKFILL_MEMORY_PAGE_SIZE = 50;
 
 type VectorModelCount = { model: string; rows: number };
 
-type MemoryTextRow = { id: number; title: string | null; body_text: string | null };
+type MemoryTextRow = {
+	id: number;
+	title: string | null;
+	body_text: string | null;
+	created_at?: string;
+};
 
 // Deliberately omits `enforceScopeVisibility` so semantic callers can never
 // disable the local read boundary — scopeVisibleFilterContext() always forces
@@ -583,85 +589,192 @@ export async function backfillVectors(
 	const where = whereClauses.length > 0 ? whereClauses.join(" AND ") : "1=1";
 	const joinSessions = project != null;
 	const joinClause = joinSessions ? "JOIN sessions ON sessions.id = memory_items.session_id" : "";
-	const limitClause = limit != null && limit > 0 ? "LIMIT ?" : "";
-	if (limit != null && limit > 0) params.push(limit);
-
-	const rows = db
-		.prepare(
-			`SELECT memory_items.id, memory_items.title, memory_items.body_text
-			 FROM memory_items ${joinClause}
-			 WHERE ${where}
-			 ORDER BY memory_items.created_at ASC ${limitClause}`,
-		)
-		.all(...params) as Array<{ id: number; title: string | null; body_text: string | null }>;
-
 	const model = client.model;
 	let checked = 0;
 	let embedded = 0;
 	let inserted = 0;
 	let skipped = 0;
+	const rowLimit = limit != null && limit > 0 ? limit : Infinity;
+	let cursor: { createdAt: string; id: number } | null = null;
+	const { highWater, insertionHighWaterId } = db.transaction(() => {
+		const insertionHighWater = db.prepare("SELECT MAX(id) AS id FROM memory_items").get() as {
+			id: number | null;
+		};
+		const row = db
+			.prepare(
+				`SELECT memory_items.id, memory_items.created_at
+				 FROM memory_items ${joinClause}
+				 WHERE ${where}
+				 ORDER BY memory_items.created_at DESC, memory_items.id DESC
+				 LIMIT 1`,
+			)
+			.get(...params) as Pick<MemoryTextRow, "id" | "created_at"> | undefined;
+		return { highWater: row, insertionHighWaterId: insertionHighWater.id };
+	})();
+	if (!highWater) return { checked, embedded, inserted, skipped };
+	if (!Number.isInteger(insertionHighWaterId)) {
+		throw new TypeError("Backfill insertion high-water row is missing id");
+	}
+	if (typeof highWater.created_at !== "string") {
+		throw new TypeError("Backfill high-water row is missing created_at");
+	}
+	const selectFirstPage = db.prepare(
+		`SELECT memory_items.id, memory_items.title, memory_items.body_text, memory_items.created_at
+		 FROM memory_items ${joinClause}
+		 WHERE ${where}
+		   AND memory_items.id <= ?
+		   AND (memory_items.created_at < ? OR (memory_items.created_at = ? AND memory_items.id <= ?))
+		 ORDER BY memory_items.created_at ASC, memory_items.id ASC
+		 LIMIT ?`,
+	);
+	const selectNextPage = db.prepare(
+		`SELECT memory_items.id, memory_items.title, memory_items.body_text, memory_items.created_at
+		 FROM memory_items ${joinClause}
+		 WHERE ${where}
+		   AND memory_items.id <= ?
+		   AND (memory_items.created_at > ? OR (memory_items.created_at = ? AND memory_items.id > ?))
+		   AND (memory_items.created_at < ? OR (memory_items.created_at = ? AND memory_items.id <= ?))
+		 ORDER BY memory_items.created_at ASC, memory_items.id ASC
+		 LIMIT ?`,
+	);
 
-	for (const row of rows) {
-		if (signal?.aborted) break;
-		checked++;
-		const text = memoryText(row.title, row.body_text);
-		const chunks = chunkText(text);
-		if (chunks.length === 0) continue;
+	while (checked < rowLimit && !signal?.aborted) {
+		const pageSize = Math.min(BACKFILL_MEMORY_PAGE_SIZE, rowLimit - checked);
+		const rows = (
+			cursor
+				? selectNextPage.all(
+						...params,
+						insertionHighWaterId,
+						cursor.createdAt,
+						cursor.createdAt,
+						cursor.id,
+						highWater.created_at,
+						highWater.created_at,
+						highWater.id,
+						pageSize,
+					)
+				: selectFirstPage.all(
+						...params,
+						insertionHighWaterId,
+						highWater.created_at,
+						highWater.created_at,
+						highWater.id,
+						pageSize,
+					)
+		) as MemoryTextRow[];
+		if (rows.length === 0) break;
+		const lastRow = rows.at(-1);
+		if (!lastRow || typeof lastRow.created_at !== "string") {
+			throw new TypeError("Backfill row is missing created_at");
+		}
+		// This cursor lives only for this invocation. An aborted caller starts a fresh pass.
+		cursor = { createdAt: lastRow.created_at, id: lastRow.id };
 
-		// Check existing hashes
+		const placeholders = rows.map(() => "?").join(", ");
 		const existingRows = db
-			.prepare("SELECT content_hash FROM memory_vectors WHERE memory_id = ? AND model = ?")
-			.all(row.id, model) as Array<{ content_hash: string | null }>;
-		const existingHashes = new Set(
-			existingRows.map((r) => r.content_hash).filter((h): h is string => h != null),
-		);
+			.prepare(
+				`SELECT memory_id, content_hash FROM memory_vectors
+				 WHERE model = ? AND memory_id IN (${placeholders})`,
+			)
+			.all(model, ...rows.map((row) => row.id)) as Array<{
+			memory_id: number;
+			content_hash: string | null;
+		}>;
+		const existingHashesByMemory = new Map<number, Set<string>>();
+		for (const existing of existingRows) {
+			if (existing.content_hash == null) continue;
+			const hashes = existingHashesByMemory.get(existing.memory_id) ?? new Set<string>();
+			hashes.add(existing.content_hash);
+			existingHashesByMemory.set(existing.memory_id, hashes);
+		}
 
-		const pendingChunks: string[] = [];
-		const pendingHashes: string[] = [];
-		const pendingChunkIndexes: number[] = [];
-		for (const [chunkIndex, chunk] of chunks.entries()) {
-			const h = hashText(chunk);
-			if (existingHashes.has(h)) {
-				skipped++;
+		for (const row of rows) {
+			if (signal?.aborted) break;
+			checked++;
+			const chunks = chunkText(memoryText(row.title, row.body_text));
+			const existingHashes = existingHashesByMemory.get(row.id) ?? new Set<string>();
+			const pendingChunks: string[] = [];
+			const pendingHashes: string[] = [];
+			const pendingChunkIndexes: number[] = [];
+			for (const [chunkIndex, text] of chunks.entries()) {
+				const contentHash = hashText(text);
+				if (existingHashes.has(contentHash)) {
+					skipped++;
+					continue;
+				}
+				pendingChunks.push(text);
+				pendingHashes.push(contentHash);
+				pendingChunkIndexes.push(chunkIndex);
+			}
+			if (pendingChunks.length === 0) continue;
+
+			const embeddings = await embedTexts(pendingChunks);
+			if (embeddings.length !== pendingChunks.length) {
+				throw new TypeError(
+					`Embedding client returned ${embeddings.length} vectors for ${pendingChunks.length} texts`,
+				);
+			}
+			const entries = embeddings.map((vector, index) => {
+				if (vector.length !== client.dimensions) {
+					throw new TypeError(
+						`Embedding client returned vector dimension ${vector.length}, expected ${client.dimensions}`,
+					);
+				}
+				for (const value of vector) {
+					if (!Number.isFinite(value)) {
+						throw new TypeError("Embedding client returned a non-finite vector value");
+					}
+				}
+				return {
+					vector,
+					chunkIndex: pendingChunkIndexes[index] as number,
+					contentHash: pendingHashes[index] as string,
+				};
+			});
+			embedded += entries.length;
+			if (dryRun) {
+				inserted += entries.length;
 				continue;
 			}
-			pendingChunks.push(chunk);
-			pendingHashes.push(h);
-			pendingChunkIndexes.push(chunkIndex);
+			// The page-wide existing-hash snapshot can go stale between that query
+			// and this insert when a concurrent writer (e.g. a vector migration
+			// worker running alongside `codemem embed`) vectors the same memory.
+			// memory_vectors is a vec0 table with no uniqueness constraint, so
+			// re-read this memory's current hashes inside an immediate transaction
+			// and skip any that now exist, preventing permanent duplicate rows.
+			const insertVectors = db.transaction(
+				(items: Array<{ vector: Float32Array; chunkIndex: number; contentHash: string }>) => {
+					const currentHashes = new Set(
+						(
+							db
+								.prepare(
+									"SELECT content_hash FROM memory_vectors WHERE memory_id = ? AND model = ?",
+								)
+								.all(row.id, model) as Array<{ content_hash: string | null }>
+						)
+							.map((existing) => existing.content_hash)
+							.filter((hash): hash is string => hash != null),
+					);
+					let insertedInTx = 0;
+					for (const entry of items) {
+						if (currentHashes.has(entry.contentHash)) continue;
+						insertMemoryVector(
+							db,
+							entry.vector,
+							row.id,
+							entry.chunkIndex,
+							entry.contentHash,
+							model,
+						);
+						currentHashes.add(entry.contentHash);
+						insertedInTx++;
+					}
+					return insertedInTx;
+				},
+			);
+			inserted += insertVectors.immediate(entries);
 		}
-
-		if (pendingChunks.length === 0) continue;
-
-		const embeddings = await embedTexts(pendingChunks);
-		if (embeddings.length === 0) continue;
-		embedded += embeddings.length;
-
-		if (dryRun) {
-			inserted += embeddings.length;
-			continue;
-		}
-
-		const insertVectors = db.transaction(
-			(entries: Array<{ vector: Float32Array; chunkIndex: number; contentHash: string }>) => {
-				for (const entry of entries) {
-					insertMemoryVector(db, entry.vector, row.id, entry.chunkIndex, entry.contentHash, model);
-				}
-			},
-		);
-		const entries: Array<{ vector: Float32Array; chunkIndex: number; contentHash: string }> = [];
-		for (let i = 0; i < embeddings.length; i++) {
-			const vector = embeddings[i];
-			const contentHash = pendingHashes[i];
-			const chunkIndex = pendingChunkIndexes[i];
-			if (!vector || vector.length === 0) continue;
-			if (!contentHash) continue;
-			if (chunkIndex == null) continue;
-			entries.push({ vector, chunkIndex, contentHash });
-		}
-		if (entries.length > 0) {
-			insertVectors(entries);
-			inserted += entries.length;
-		}
+		if (rows.length < pageSize) break;
 	}
 
 	return { checked, embedded, inserted, skipped };
