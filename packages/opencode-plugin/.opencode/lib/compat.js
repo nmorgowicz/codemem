@@ -27,10 +27,20 @@ export const resolveUpgradeGuidance = ({ runner, runnerFrom }) => {
     };
   }
 
+  if (normalizedRunner === "codemem") {
+    return {
+      mode: "global",
+      action:
+        "Run `npm install -g codemem @codemem/embeddings` to update both the CLI and the optional semantic runtime, then restart OpenCode. On Linux, prefix with `ONNXRUNTIME_NODE_INSTALL=skip` to avoid the unused GPU provider download.",
+      note: "detected global codemem runner mode",
+    };
+  }
+
   if (normalizedRunner === "npx") {
     return {
       mode: "npx",
-      action: "Run `npm install -g codemem` to update, then restart OpenCode.",
+      action:
+        "Run `npm install -g codemem @codemem/embeddings` to update the CLI and optional semantic runtime, then restart OpenCode. On Linux, prefix with `ONNXRUNTIME_NODE_INSTALL=skip` to avoid the unused GPU provider download.",
       note: "detected npx runner mode",
     };
   }
@@ -139,8 +149,8 @@ export const resolveAutoUpdatePlan = ({ runner, runnerFrom, runnerFromExplicit =
 		return {
       allowed: true,
       reason: null,
-      command: ["npm", "install", "-g", "codemem@latest"],
-      commandText: "npm install -g codemem@latest",
+      command: ["npm", "install", "-g", "codemem@latest", "@codemem/embeddings@latest"],
+      commandText: "npm install -g codemem@latest @codemem/embeddings@latest",
     };
   }
 
@@ -166,8 +176,8 @@ export const resolveAutoUpdatePlan = ({ runner, runnerFrom, runnerFromExplicit =
 		return {
 			allowed: true,
 			reason: null,
-			command: ["npm", "install", "-g", "codemem@latest"],
-			commandText: "npm install -g codemem@latest",
+			command: ["npm", "install", "-g", "codemem@latest", "@codemem/embeddings@latest"],
+			commandText: "npm install -g codemem@latest @codemem/embeddings@latest",
 		};
 	}
 

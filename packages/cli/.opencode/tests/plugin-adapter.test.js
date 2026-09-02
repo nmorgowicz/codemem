@@ -302,14 +302,65 @@ describe("opencode adapter event mapping", () => {
     expect(args).toEqual([]);
   });
 
-  test("buildRunnerArgs pins npx to backend version", () => {
+  test("buildRunnerArgs pins the npx CLI and embedding runtime together", () => {
     const args = __testUtils.buildRunnerArgs({
       runner: "npx",
       runnerFrom: "/some/path",
       runnerFromExplicit: false,
     });
 
-    expect(args).toEqual(["-y", `codemem@${__testUtils.PINNED_BACKEND_VERSION}`]);
+    expect(args).toEqual([
+      "-y",
+      "--package",
+      `codemem@${__testUtils.PINNED_BACKEND_VERSION}`,
+      "--package",
+      `@codemem/embeddings@${__testUtils.PINNED_BACKEND_VERSION}`,
+      "codemem",
+    ]);
+  });
+
+  test("buildRunnerArgs preserves a non-codemem explicit npx override", () => {
+    expect(
+      __testUtils.buildRunnerArgs({
+        runner: "npx",
+        runnerFrom: "custom-codemem-package",
+        runnerFromExplicit: true,
+      }),
+    ).toEqual(["-y", "custom-codemem-package"]);
+  });
+
+  test("buildRunnerArgs pairs an explicit codemem@version override with embeddings", () => {
+    expect(
+      __testUtils.buildRunnerArgs({
+        runner: "npx",
+        runnerFrom: "codemem@1.2.3",
+        runnerFromExplicit: true,
+      }),
+    ).toEqual([
+      "-y",
+      "--package",
+      "codemem@1.2.3",
+      "--package",
+      "@codemem/embeddings@1.2.3",
+      "codemem",
+    ]);
+  });
+
+  test("buildRunnerArgs pairs a bare codemem explicit override with embeddings", () => {
+    expect(
+      __testUtils.buildRunnerArgs({
+        runner: "npx",
+        runnerFrom: "codemem",
+        runnerFromExplicit: true,
+      }),
+    ).toEqual([
+      "-y",
+      "--package",
+      "codemem",
+      "--package",
+      "@codemem/embeddings",
+      "codemem",
+    ]);
   });
 
   test("CLI-bundled plugin pin stays in lockstep with the CLI package version", () => {

@@ -16,11 +16,13 @@ codemem update check --json
 - Stale validated cache data remains clearly labeled and may provide guidance when the registry is
   unavailable.
 - This command never installs or executes an update. Release installation remains outside this
-  read-only check. `codemem update install` is the separate, fail-closed installer: it refreshes
+  read-only check. `codemem update` is the separate, fail-closed installer: it refreshes
   release status, requires a proven global npm installation and a stable release observed for at
-  least 24 hours, installs the exact validated version from the public npm registry, and verifies
-  the active `codemem` command. It refuses npx, Docker, pinned, development, stale, prerelease,
-  downgrade, and unknown installations.
+  least 24 hours, installs exact matching `codemem` and `@codemem/embeddings` versions from the
+  public npm registry, and verifies the active `codemem` command. It refuses npx, Docker, pinned,
+  development, stale, prerelease, downgrade, and unknown installations. The older
+  `codemem update install` spelling remains available for automation compatibility. As with a
+  manual npm install, npm runs the packages' installation scripts for native CPU dependencies.
 
 ## Start or restart the viewer
 - `codemem serve` runs the viewer in the foreground.

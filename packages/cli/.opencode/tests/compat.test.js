@@ -68,6 +68,19 @@ describe("resolveUpgradeGuidance", () => {
     expect(guidance.mode).toBe("generic");
     expect(guidance.action).toContain("normal install method");
   });
+
+  test("tells the global codemem runner to install the embedding runtime too", () => {
+    const guidance = resolveUpgradeGuidance({ runner: "codemem", runnerFrom: "" });
+    expect(guidance.mode).toBe("global");
+    expect(guidance.action).toContain("npm install -g codemem @codemem/embeddings");
+    expect(guidance.action).toContain("ONNXRUNTIME_NODE_INSTALL=skip");
+  });
+
+  test("tells the npx runner to install both packages", () => {
+    const guidance = resolveUpgradeGuidance({ runner: "npx", runnerFrom: "codemem@latest" });
+    expect(guidance.mode).toBe("npx");
+    expect(guidance.action).toContain("npm install -g codemem @codemem/embeddings");
+  });
 });
 
 describe("parseBackendUpdatePolicy", () => {
@@ -91,10 +104,16 @@ describe("parseBackendUpdatePolicy", () => {
 });
 
 describe("resolveAutoUpdatePlan", () => {
-	test("allows the known global npm runner", () => {
+	test("allows the known global npm runner and updates both packages", () => {
 		const plan = resolveAutoUpdatePlan({ runner: "codemem", runnerFrom: "/tmp/project" });
 		expect(plan.allowed).toBe(true);
-		expect(plan.command).toEqual(["npm", "install", "-g", "codemem@latest"]);
+		expect(plan.command).toEqual([
+			"npm",
+			"install",
+			"-g",
+			"codemem@latest",
+			"@codemem/embeddings@latest",
+		]);
 	});
 
 	test("blocks unknown runners", () => {

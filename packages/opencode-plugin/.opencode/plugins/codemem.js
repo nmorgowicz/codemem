@@ -1704,13 +1704,46 @@ const tsCliAvailable = (cliPath) => {
   }
 };
 
+// When an explicit npx override targets the codemem package, pair it with the
+// matching @codemem/embeddings spec so the detached Viewer can resolve the
+// optional runtime instead of silently falling back to lexical search. Returns
+// null for any spec that is not a bare `codemem`/`codemem@<version>`, so custom
+// package overrides pass through unchanged.
+const pairedEmbeddingsForCodememSpec = (spec) => {
+  if (typeof spec !== "string") return null;
+  const trimmed = spec.trim();
+  if (trimmed === "codemem") return "@codemem/embeddings";
+  const match = /^codemem@([^\s]+)$/.exec(trimmed);
+  return match ? `@codemem/embeddings@${match[1]}` : null;
+};
+
 const buildRunnerArgs = ({ runner, runnerFrom, runnerFromExplicit }) => {
   if (runner === "codemem") {
     return [];
   }
   if (runner === "npx") {
-    const pkg = runnerFromExplicit ? runnerFrom : `codemem@${PINNED_BACKEND_VERSION}`;
-    return ["-y", pkg];
+    if (runnerFromExplicit) {
+      const pairedEmbeddings = pairedEmbeddingsForCodememSpec(runnerFrom);
+      if (pairedEmbeddings) {
+        return [
+          "-y",
+          "--package",
+          runnerFrom,
+          "--package",
+          pairedEmbeddings,
+          "codemem",
+        ];
+      }
+      return ["-y", runnerFrom];
+    }
+    return [
+      "-y",
+      "--package",
+      `codemem@${PINNED_BACKEND_VERSION}`,
+      "--package",
+      `@codemem/embeddings@${PINNED_BACKEND_VERSION}`,
+      "codemem",
+    ];
   }
   if (runner === "node") {
     const cliPath = runnerFromExplicit
@@ -2850,7 +2883,7 @@ export const CodememPlugin = async ({
       await logLine("compat.auto_update_start cmd=codemem update install --json");
       const updateResult = await runCli(
         ["update", "install", "--json"],
-        { timeoutMs: 420_000 }
+        { timeoutMs: 480_000 }
       );
       if (updateResult?.exitCode === 0) {
         await logLine(
@@ -2936,7 +2969,7 @@ export const CodememPlugin = async ({
       if (autoPlan.allowed) {
         const installation = await runCli(
           ["update", "install", "--json"],
-          { timeoutMs: 420_000 }
+          { timeoutMs: 480_000 }
         );
         if (installation?.exitCode === 0) {
           const viewerRestart = await restartViewerAfterAutoUpdate();

@@ -7,6 +7,15 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+const { createEmbeddingRuntimeMock } = vi.hoisted(() => ({
+	createEmbeddingRuntimeMock: vi.fn(),
+}));
+
+vi.mock("@codemem/embeddings", () => ({
+	createEmbeddingRuntime: createEmbeddingRuntimeMock,
+}));
+
 import {
 	_resetEmbeddingRuntimeFactory,
 	_setEmbeddingRuntimeFactory,
@@ -29,12 +38,25 @@ describe("embedding runtime factory", () => {
 
 	beforeEach(() => {
 		delete process.env.CODEMEM_EMBEDDING_DISABLED;
+		createEmbeddingRuntimeMock.mockReset();
 	});
 
 	afterEach(() => {
+		vi.restoreAllMocks();
 		_resetEmbeddingRuntimeFactory();
 		if (originalEmbeddingDisabled === undefined) delete process.env.CODEMEM_EMBEDDING_DISABLED;
 		else process.env.CODEMEM_EMBEDDING_DISABLED = originalEmbeddingDisabled;
+	});
+
+	it("delegates the resolved model request to the optional runtime without loading a model", async () => {
+		const client = fakeClient(resolveEmbeddingModel());
+		createEmbeddingRuntimeMock.mockResolvedValue(client);
+
+		await expect(getEmbeddingClient()).resolves.toBe(client);
+		expect(createEmbeddingRuntimeMock).toHaveBeenCalledWith({
+			model: resolveEmbeddingModel(),
+		});
+		expect(client.embed).not.toHaveBeenCalled();
 	});
 
 	it("receives the resolved model request", async () => {
@@ -104,12 +126,18 @@ describe("embedding runtime factory", () => {
 	});
 
 	it("returns null when the factory fails", async () => {
+		const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
 		const factory = vi.fn(async () => {
 			throw new Error("runtime unavailable");
 		});
 		_setEmbeddingRuntimeFactory(factory);
 
 		await expect(getEmbeddingClient()).resolves.toBeNull();
+		await expect(getEmbeddingClient()).resolves.toBeNull();
+		expect(warn).toHaveBeenCalledOnce();
+		expect(warn).toHaveBeenCalledWith(
+			"Semantic search is unavailable because the embedding runtime failed: runtime unavailable",
+		);
 	});
 
 	it("does not call the factory when embeddings are disabled", async () => {
