@@ -62,9 +62,44 @@ test("OpenCode identity targeting matches the core contract for absolute paths",
 		CODEMEM_PACK_COMPRESSION: "ids",
 		CODEMEM_EMBEDDING_DISABLED: "yes",
 		CODEMEM_EMBEDDING_MODEL: "model-1",
+		CODEMEM_EMBEDDING_REVISION: "revision-1",
 	};
 	const { __testUtils } = await import("../plugins/codemem.js");
 	expect(__testUtils.buildViewerIdentityTarget(env, root)).toEqual(buildViewerIdentityTarget(env));
+});
+
+test("OpenCode identity targeting preserves a missing custom-model revision as null", async () => {
+	const root = resolve("/tmp/codemem-opencode-identity-custom-model");
+	const env = {
+		HOME: join(root, "home"),
+		CODEMEM_EMBEDDING_MODEL: "custom/model",
+		CODEMEM_EMBEDDING_REVISION: "   ",
+	};
+	const { __testUtils } = await import("../plugins/codemem.js");
+
+	expect(__testUtils.buildViewerIdentityTarget(env, root)).toEqual(buildViewerIdentityTarget(env));
+	expect(__testUtils.buildViewerIdentityTarget(env, root)).toMatchObject({
+		embedding_model: "custom/model",
+		embedding_revision: null,
+	});
+});
+
+test("OpenCode identity rejects a mutable revision even for the default model", async () => {
+	const root = resolve("/tmp/codemem-opencode-identity-default-mutable");
+	const env = {
+		HOME: join(root, "home"),
+		// Default model but a mutable ref: core rejects it to null, so the plugin
+		// must not fall back to the pinned default revision (that would mismatch
+		// the viewer identity and force the local CLI fallback).
+		CODEMEM_EMBEDDING_REVISION: "main",
+	};
+	const { __testUtils } = await import("../plugins/codemem.js");
+
+	expect(__testUtils.buildViewerIdentityTarget(env, root)).toEqual(buildViewerIdentityTarget(env));
+	expect(__testUtils.buildViewerIdentityTarget(env, root)).toMatchObject({
+		embedding_model: "Xenova/bge-small-en-v1.5",
+		embedding_revision: null,
+	});
 });
 
 const normalizeIdentityPath = (value, cwd = "/tmp/greenroom") => {
@@ -76,29 +111,45 @@ const normalizeIdentityPath = (value, cwd = "/tmp/greenroom") => {
 	return resolve(cwd, expanded);
 };
 
-const viewerProfileResponse = (overrides = {}) => jsonResponse(200, {
-	service: "codemem-viewer",
-	protocol_version: 1,
-	min_supported_protocol_version: 1,
-	db_path: resolve(
-		normalizeIdentityPath(process.env.CODEMEM_DB) || join(homedir(), ".codemem", "mem.sqlite"),
-	),
-	identity_target: {
-		device_id: process.env.CODEMEM_DEVICE_ID?.trim() || null,
-		actor_id_present: Object.hasOwn(process.env, "CODEMEM_ACTOR_ID"),
-		actor_id: process.env.CODEMEM_ACTOR_ID?.trim() || null,
-		config_path: normalizeIdentityPath(process.env.CODEMEM_CONFIG),
-		runtime_root: normalizeIdentityPath(process.env.CODEMEM_RUNTIME_ROOT),
-		workspace_id: process.env.CODEMEM_WORKSPACE_ID?.trim() || null,
-		home_dir: normalizeIdentityPath(process.env.HOME || homedir()),
-		pack_compression: process.env.CODEMEM_PACK_COMPRESSION?.trim() || null,
-		embedding_disabled: ["1", "true", "yes"].includes(
-			String(process.env.CODEMEM_EMBEDDING_DISABLED || "").toLowerCase(),
+const viewerProfileResponse = (overrides = {}) => {
+	const embeddingModel = process.env.CODEMEM_EMBEDDING_MODEL || "Xenova/bge-small-en-v1.5";
+	const rawEmbeddingRevision = process.env.CODEMEM_EMBEDDING_REVISION?.trim();
+	// Mirror core exactly: a configured revision is used only when commit-addressed;
+	// a rejected mutable ref yields null even for the default model.
+	let embeddingRevision;
+	if (rawEmbeddingRevision) {
+		embeddingRevision = /^[0-9a-f]{7,40}$/.test(rawEmbeddingRevision) ? rawEmbeddingRevision : null;
+	} else {
+		embeddingRevision =
+			embeddingModel === "Xenova/bge-small-en-v1.5"
+				? "ea104dacec62c0de699686887e3f920caeb4f3e3"
+				: null;
+	}
+	return jsonResponse(200, {
+		service: "codemem-viewer",
+		protocol_version: 1,
+		min_supported_protocol_version: 1,
+		db_path: resolve(
+			normalizeIdentityPath(process.env.CODEMEM_DB) || join(homedir(), ".codemem", "mem.sqlite"),
 		),
-		embedding_model: process.env.CODEMEM_EMBEDDING_MODEL || "Xenova/bge-small-en-v1.5",
-	},
-	...overrides,
-});
+		identity_target: {
+			device_id: process.env.CODEMEM_DEVICE_ID?.trim() || null,
+			actor_id_present: Object.hasOwn(process.env, "CODEMEM_ACTOR_ID"),
+			actor_id: process.env.CODEMEM_ACTOR_ID?.trim() || null,
+			config_path: normalizeIdentityPath(process.env.CODEMEM_CONFIG),
+			runtime_root: normalizeIdentityPath(process.env.CODEMEM_RUNTIME_ROOT),
+			workspace_id: process.env.CODEMEM_WORKSPACE_ID?.trim() || null,
+			home_dir: normalizeIdentityPath(process.env.HOME || homedir()),
+			pack_compression: process.env.CODEMEM_PACK_COMPRESSION?.trim() || null,
+			embedding_disabled: ["1", "true", "yes"].includes(
+				String(process.env.CODEMEM_EMBEDDING_DISABLED || "").toLowerCase(),
+			),
+			embedding_model: embeddingModel,
+			embedding_revision: embeddingRevision,
+		},
+		...overrides,
+	});
+};
 
 const messageOutput = ({
 	messageId = "user-viewer",
@@ -251,6 +302,7 @@ describe("OpenCode transform-time injection", () => {
 			"CODEMEM_PACK_COMPRESSION",
 			"CODEMEM_EMBEDDING_DISABLED",
 			"CODEMEM_EMBEDDING_MODEL",
+			"CODEMEM_EMBEDDING_REVISION",
 		]) {
 			delete process.env[key];
 		}
@@ -1681,6 +1733,7 @@ describe("OpenCode transform-time injection", () => {
 		process.env.CODEMEM_PACK_COMPRESSION = "off";
 		process.env.CODEMEM_EMBEDDING_DISABLED = "true";
 		process.env.CODEMEM_EMBEDDING_MODEL = "test-embedding-model";
+		process.env.CODEMEM_EMBEDDING_REVISION = "test-embedding-revision";
 		const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (url) =>
 			String(url).endsWith("/api/prompt-pack-profile")
 				? viewerProfileResponse()
@@ -1710,6 +1763,9 @@ describe("OpenCode transform-time injection", () => {
 					pack_compression: "off",
 					embedding_disabled: true,
 					embedding_model: "test-embedding-model",
+					// A mutable custom-model revision normalizes to null in both the
+					// plugin identity target and the viewer profile.
+					embedding_revision: null,
 				},
 			retrieval_status: "skipped",
 			failure_code: "injection_disabled",
@@ -1789,6 +1845,7 @@ describe("OpenCode transform-time injection", () => {
 				pack_compression: null,
 				embedding_disabled: false,
 				embedding_model: "Xenova/bge-small-en-v1.5",
+				embedding_revision: "ea104dacec62c0de699686887e3f920caeb4f3e3",
 			},
 		});
 		expect(cachedOutput.messages[0].parts.at(-1).text).toBe(

@@ -1,6 +1,12 @@
 import type { Database as SqliteDatabase } from "better-sqlite3";
 import { connect, isEmbeddingDisabled, loadSqliteVec, resolveDbPath } from "./db.js";
-import { getEmbeddingClient, resolveEmbeddingModel } from "./embeddings.js";
+import {
+	DEFAULT_EMBEDDING_VECTOR_IDENTITY_LABEL,
+	getEmbeddingClient,
+	resolveEmbeddingModel,
+	resolveEmbeddingVectorIdentityLabel,
+	tryResolveEmbeddingRevision,
+} from "./embeddings.js";
 import {
 	completeMaintenanceJob,
 	failMaintenanceJob,
@@ -9,9 +15,15 @@ import {
 	updateMaintenanceJob,
 } from "./maintenance-jobs.js";
 import type { ReplicationVectorWork } from "./sync-replication.js";
-import { backfillVectors, pruneStaleCurrentModelVectors } from "./vectors.js";
+import {
+	backfillVectors,
+	countIncompleteActiveMemoryVectorCoverage,
+	pruneObsoleteTargetModelVectors,
+	pruneStaleCurrentModelVectors,
+} from "./vectors.js";
 
 export const VECTOR_MODEL_MIGRATION_JOB = "vector_model_migration";
+const LEGACY_DEFAULT_EMBEDDING_MODEL = "Xenova/bge-small-en-v1.5";
 const SYNC_BOOTSTRAP_TRIGGER = "sync_bootstrap";
 const SYNC_INCREMENTAL_TRIGGER = "sync_incremental";
 
@@ -42,6 +54,9 @@ type MigrationMetadata = {
 	processed_embeddable?: number;
 	embeddable_total?: number;
 	removed_stale_rows?: number;
+	uncovered_target_memories?: number;
+	cleanup_pending?: boolean;
+	cutover_retry_count?: number;
 	trigger?: string | null;
 	pending_upsert_memory_ids?: number[];
 	pending_delete_memory_ids?: number[];
@@ -169,6 +184,7 @@ async function runQueuedSyncVectorWork(
 		deleteVectorsForMemoryIds(db, pendingDeleteMemoryIds);
 	}
 	const batchUpsertMemoryIds = pendingUpsertMemoryIds.slice(0, batchSize);
+	let prunedRows = 0;
 	if (batchUpsertMemoryIds.length > 0) {
 		await backfillVectors(db, { memoryIds: batchUpsertMemoryIds, signal });
 		// If the abort fired mid-batch, backfillVectors may have only
@@ -178,11 +194,12 @@ async function runQueuedSyncVectorWork(
 		if (signal?.aborted) {
 			return { completed: false, metadata };
 		}
-		pruneStaleCurrentModelVectors(db, batchUpsertMemoryIds, targetModel);
+		prunedRows = pruneStaleCurrentModelVectors(db, batchUpsertMemoryIds, targetModel);
 	}
 
 	const drainedMetadata: MigrationMetadata = {
 		...metadata,
+		removed_stale_rows: Number(metadata.removed_stale_rows ?? 0) + prunedRows,
 		pending_delete_memory_ids: [],
 		pending_upsert_memory_ids: pendingUpsertMemoryIds.slice(batchUpsertMemoryIds.length),
 	};
@@ -275,6 +292,10 @@ function countEmbeddableActiveMemories(db: SqliteDatabase): number {
 	return Number(row?.c ?? 0);
 }
 
+function describeIncompleteTargetMemories(count: number): string {
+	return `${count} ${count === 1 ? "memory" : "memories"}`;
+}
+
 function selectNextMigrationBatch(
 	db: SqliteDatabase,
 	afterId: number,
@@ -305,24 +326,211 @@ function nextMigrationMetadata(
 	embeddableTotal: number,
 ): MigrationMetadata {
 	const metadata = (job?.metadata ?? {}) as MigrationMetadata;
+	if (metadata.target_model !== targetModel) {
+		return {
+			source_model: sourceModel,
+			target_model: targetModel,
+			last_cursor_id: 0,
+			processed_embeddable: 0,
+			embeddable_total: embeddableTotal,
+		};
+	}
 	return {
 		source_model: sourceModel ?? metadata.source_model ?? null,
 		target_model: targetModel,
 		last_cursor_id: Number(metadata.last_cursor_id ?? 0),
 		processed_embeddable: Number(metadata.processed_embeddable ?? 0),
 		embeddable_total: Number(metadata.embeddable_total ?? embeddableTotal),
+		removed_stale_rows: metadata.removed_stale_rows,
 	};
 }
 
-function cleanupStaleModels(db: SqliteDatabase, targetModel: string): number {
-	const row = db
-		.prepare("SELECT COUNT(*) AS c FROM memory_vectors WHERE model != ?")
-		.get(targetModel) as { c?: number } | undefined;
-	const count = Number(row?.c ?? 0);
-	if (count > 0) {
-		db.prepare("DELETE FROM memory_vectors WHERE model != ?").run(targetModel);
+function deleteStaleModelVectors(
+	db: SqliteDatabase,
+	targetModel: string,
+	signal?: AbortSignal,
+): { deleted: number; exhausted: boolean } {
+	const batchSize = 250;
+	let afterRowId = 0;
+	let deleted = 0;
+	const selectStmt = db.prepare(
+		"SELECT rowid FROM memory_vectors WHERE model != ? AND rowid > ? ORDER BY rowid ASC LIMIT ?",
+	);
+	const deleteStmt = db.prepare("DELETE FROM memory_vectors WHERE rowid = ?");
+	while (!signal?.aborted) {
+		const rows = selectStmt.all(targetModel, afterRowId, batchSize) as Array<{ rowid: number }>;
+		if (rows.length === 0) return { deleted, exhausted: true };
+		db.transaction(() => {
+			for (const row of rows) deleted += deleteStmt.run(row.rowid).changes;
+		})();
+		afterRowId = rows.at(-1)?.rowid ?? afterRowId;
 	}
-	return count;
+	return { deleted, exhausted: false };
+}
+
+function cleanupStaleModels(db: SqliteDatabase, targetModel: string): number {
+	const { deleted } = deleteStaleModelVectors(db, targetModel);
+	// Also prune obsolete rows within the target model: coverage is a subset
+	// check, so a memory can be "covered" while retaining target rows for content
+	// that no longer exists (interrupted migration, or an edit/redaction without
+	// vector maintenance). Leaving them lets MIN-distance recall surface stale
+	// content after the migration reports success.
+	const prunedObsolete = pruneObsoleteTargetModelVectors(db, targetModel);
+	return deleted + prunedObsolete;
+}
+
+type DatabaseMutationSnapshot = {
+	dataVersion: number;
+	totalChanges: number;
+};
+
+function readDatabaseMutationSnapshot(db: SqliteDatabase): DatabaseMutationSnapshot {
+	const row = db.prepare("SELECT total_changes() AS total_changes").get() as {
+		total_changes?: number;
+	};
+	return {
+		dataVersion: Number(db.pragma("data_version", { simple: true })),
+		totalChanges: Number(row.total_changes ?? 0),
+	};
+}
+
+function sameDatabaseMutationSnapshot(
+	db: SqliteDatabase,
+	snapshot: DatabaseMutationSnapshot,
+): boolean {
+	const current = readDatabaseMutationSnapshot(db);
+	return (
+		current.dataVersion === snapshot.dataVersion && current.totalChanges === snapshot.totalChanges
+	);
+}
+
+function finalizeMigrationCutover(
+	db: SqliteDatabase,
+	targetModel: string,
+	metadata: MigrationMetadata,
+	lastCursorId: number,
+	processedEmbeddable: number,
+	embeddableTotal: number,
+	signal?: AbortSignal,
+): void {
+	const previouslyRemoved = Number(metadata.removed_stale_rows ?? 0);
+	const prunedTargetRows = pruneObsoleteTargetModelVectors(db, targetModel);
+	const validationSnapshot = readDatabaseMutationSnapshot(db);
+	const uncovered = countIncompleteActiveMemoryVectorCoverage(db, targetModel);
+	let readyForLegacyCleanup = false;
+	let removedBeforeCleanup = previouslyRemoved + prunedTargetRows;
+
+	db.transaction(() => {
+		const latestJob = getMaintenanceJob(db, VECTOR_MODEL_MIGRATION_JOB);
+		const latestMetadata = (latestJob?.metadata ?? {}) as MigrationMetadata;
+		removedBeforeCleanup =
+			Math.max(
+				Number(latestMetadata.removed_stale_rows ?? 0),
+				Number(metadata.removed_stale_rows ?? 0),
+			) + prunedTargetRows;
+		const progressMetadata = {
+			...(sameQueuedSyncMemoryIds(latestMetadata, metadata) ? metadata : latestMetadata),
+			last_cursor_id: lastCursorId,
+			processed_embeddable: processedEmbeddable,
+			embeddable_total: embeddableTotal,
+			removed_stale_rows: removedBeforeCleanup,
+		};
+		if (!sameQueuedSyncMemoryIds(latestMetadata, metadata)) {
+			updateMaintenanceJob(db, VECTOR_MODEL_MIGRATION_JOB, {
+				status: "running",
+				message: "Draining vector changes queued before cutover",
+				progressCurrent: processedEmbeddable,
+				progressTotal: embeddableTotal,
+				metadata: progressMetadata,
+			});
+			return;
+		}
+		if (!sameDatabaseMutationSnapshot(db, validationSnapshot)) {
+			updateMaintenanceJob(db, VECTOR_MODEL_MIGRATION_JOB, {
+				status: "running",
+				message: "Memory changes arrived during cutover validation; retrying",
+				progressCurrent: processedEmbeddable,
+				progressTotal: embeddableTotal,
+				metadata: {
+					...progressMetadata,
+					cutover_retry_count: Number(latestMetadata.cutover_retry_count ?? 0) + 1,
+				},
+			});
+			return;
+		}
+		if (uncovered > 0) {
+			failMaintenanceJob(
+				db,
+				VECTOR_MODEL_MIGRATION_JOB,
+				`Target vector coverage is incomplete for ${describeIncompleteTargetMemories(uncovered)}`,
+				{
+					message:
+						"Vector re-indexing stopped before cutover; existing valid vectors remain available",
+					metadata: {
+						...progressMetadata,
+						last_cursor_id: 0,
+						processed_embeddable: 0,
+						cutover_retry_count: 0,
+						uncovered_target_memories: uncovered,
+					},
+				},
+			);
+			return;
+		}
+		completeMaintenanceJob(db, VECTOR_MODEL_MIGRATION_JOB, {
+			message: "Finished re-indexing; removing stale vectors",
+			progressCurrent: processedEmbeddable,
+			progressTotal: embeddableTotal,
+			metadata: {
+				...progressMetadata,
+				cleanup_pending: true,
+				cutover_retry_count: 0,
+				uncovered_target_memories: undefined,
+			},
+		});
+		readyForLegacyCleanup = true;
+	}).immediate();
+
+	if (!readyForLegacyCleanup) return;
+	const cleanup = deleteStaleModelVectors(db, targetModel, signal);
+	const removed = removedBeforeCleanup + cleanup.deleted;
+	if (!cleanup.exhausted) {
+		db.transaction(() => {
+			const latestJob = getMaintenanceJob(db, VECTOR_MODEL_MIGRATION_JOB);
+			const latestMetadata = (latestJob?.metadata ?? {}) as MigrationMetadata;
+			updateMaintenanceJob(db, VECTOR_MODEL_MIGRATION_JOB, {
+				status: "completed",
+				metadata: {
+					...latestMetadata,
+					removed_stale_rows: removed,
+					cleanup_pending: true,
+				},
+			});
+		}).immediate();
+		return;
+	}
+	db.transaction(() => {
+		const latestJob = getMaintenanceJob(db, VECTOR_MODEL_MIGRATION_JOB);
+		const latestMetadata = (latestJob?.metadata ?? {}) as MigrationMetadata;
+		updateMaintenanceJob(db, VECTOR_MODEL_MIGRATION_JOB, {
+			status: "completed",
+			message:
+				removed > 0
+					? `Finished re-indexing and removed ${removed} stale vector rows`
+					: "Finished re-indexing memories",
+			progressCurrent: processedEmbeddable,
+			progressTotal: embeddableTotal,
+			metadata: {
+				...latestMetadata,
+				last_cursor_id: lastCursorId,
+				processed_embeddable: processedEmbeddable,
+				embeddable_total: embeddableTotal,
+				removed_stale_rows: removed,
+				cleanup_pending: false,
+				uncovered_target_memories: undefined,
+			},
+		});
+	}).immediate();
 }
 
 function detectSourceModel(db: SqliteDatabase, targetModel: string): string | null {
@@ -353,7 +561,10 @@ export async function runVectorMigrationPass(
 		}
 		return;
 	}
-	const targetModel = client.model;
+	const targetModel = resolveEmbeddingVectorIdentityLabel();
+	const targetDisplay = client.identity?.revision
+		? `${client.model}@${client.identity.revision.slice(0, 12)}`
+		: client.model;
 	const effectiveBatchSize = Math.max(1, options.batchSize ?? 50);
 	const existingMetadata = (existingJob?.metadata ?? {}) as MigrationMetadata;
 	const queuedSyncWorkCount =
@@ -364,6 +575,27 @@ export async function runVectorMigrationPass(
 		existingMetadata.target_model === targetModel &&
 		queuedSyncWorkCount === 0
 	) {
+		if (existingMetadata.cleanup_pending) {
+			const cleanup = deleteStaleModelVectors(db, targetModel, options.signal);
+			db.transaction(() => {
+				const latestJob = getMaintenanceJob(db, VECTOR_MODEL_MIGRATION_JOB);
+				const latestMetadata = (latestJob?.metadata ?? {}) as MigrationMetadata;
+				const removed = Number(latestMetadata.removed_stale_rows ?? 0) + cleanup.deleted;
+				updateMaintenanceJob(db, VECTOR_MODEL_MIGRATION_JOB, {
+					status: "completed",
+					message: cleanup.exhausted
+						? removed > 0
+							? `Finished re-indexing and removed ${removed} stale vector rows`
+							: "Finished re-indexing memories"
+						: "Finished re-indexing; removing stale vectors",
+					metadata: {
+						...latestMetadata,
+						removed_stale_rows: removed,
+						cleanup_pending: !cleanup.exhausted,
+					},
+				});
+			}).immediate();
+		}
 		return;
 	}
 	if (existingJob) {
@@ -438,7 +670,7 @@ export async function runVectorMigrationPass(
 	const existingMeta = (existingJob?.metadata ?? {}) as MigrationMetadata;
 	const isResumingJob = existingJob?.status === "running" || existingJob?.status === "pending";
 	const embeddableTotal =
-		isResumingJob && existingMeta.embeddable_total
+		isResumingJob && existingMeta.target_model === targetModel && existingMeta.embeddable_total
 			? Number(existingMeta.embeddable_total)
 			: countEmbeddableActiveMemories(db);
 	if (embeddableTotal <= 0 && hasInFlightJob && !sourceModel) {
@@ -484,12 +716,17 @@ export async function runVectorMigrationPass(
 	const job = existingJob;
 	const metadata = nextMigrationMetadata(job, sourceModel, targetModel, embeddableTotal);
 	if (!job || job.status === "completed" || job.status === "failed") {
+		const servesCompatibleLegacySource =
+			sourceModel === LEGACY_DEFAULT_EMBEDDING_MODEL &&
+			targetModel === DEFAULT_EMBEDDING_VECTOR_IDENTITY_LABEL;
 		startMaintenanceJob(db, {
 			kind: VECTOR_MODEL_MIGRATION_JOB,
 			title: "Re-indexing memories",
-			message: sourceModel
-				? `Building ${targetModel} vectors while semantic search falls back to FTS-only`
-				: `Building ${targetModel} vectors`,
+			message: servesCompatibleLegacySource
+				? `Building ${targetDisplay} vectors while semantic search continues on the compatible legacy index`
+				: sourceModel
+					? `Building ${targetDisplay} vectors while semantic search uses FTS-only`
+					: `Building ${targetDisplay} vectors`,
 			progressTotal: embeddableTotal,
 			metadata,
 		});
@@ -512,59 +749,57 @@ export async function runVectorMigrationPass(
 		// re-process this batch from the same cursor to cover any rows the
 		// abort skipped. Leave the metadata untouched.
 		if (options.signal?.aborted) return;
+		const prunedCoveredRows = pruneStaleCurrentModelVectors(db, batchIds, targetModel);
+		const metadataAfterPrune: MigrationMetadata = {
+			...metadata,
+			removed_stale_rows: Number(metadata.removed_stale_rows ?? 0) + prunedCoveredRows,
+		};
 		if (batchRows.length < effectiveBatchSize) {
-			db.transaction(() => {
-				const removed = cleanupStaleModels(db, targetModel);
-				completeMaintenanceJob(db, VECTOR_MODEL_MIGRATION_JOB, {
-					message:
-						removed > 0
-							? `Finished re-indexing and removed ${removed} stale vector rows`
-							: "Finished re-indexing memories",
-					progressCurrent: processedEmbeddable,
-					progressTotal: embeddableTotal,
-					metadata: {
-						...metadata,
-						last_cursor_id: lastCursorId,
-						processed_embeddable: processedEmbeddable,
-						embeddable_total: embeddableTotal,
-						removed_stale_rows: removed,
-					},
-				});
-			})();
+			finalizeMigrationCutover(
+				db,
+				targetModel,
+				metadataAfterPrune,
+				lastCursorId,
+				processedEmbeddable,
+				embeddableTotal,
+				options.signal,
+			);
 			return;
 		}
-		updateMaintenanceJob(db, VECTOR_MODEL_MIGRATION_JOB, {
-			message: `Re-indexed ${processedEmbeddable} of ${embeddableTotal} memories`,
-			progressCurrent: processedEmbeddable,
-			progressTotal: embeddableTotal,
-			metadata: {
-				...metadata,
-				last_cursor_id: lastCursorId,
-				processed_embeddable: processedEmbeddable,
-				embeddable_total: embeddableTotal,
-			},
-		});
+		db.transaction(() => {
+			const latestJob = getMaintenanceJob(db, VECTOR_MODEL_MIGRATION_JOB);
+			const latestMetadata = (latestJob?.metadata ?? {}) as MigrationMetadata;
+			updateMaintenanceJob(db, VECTOR_MODEL_MIGRATION_JOB, {
+				status: "running",
+				message: `Re-indexed ${processedEmbeddable} of ${embeddableTotal} memories with ${targetDisplay}`,
+				progressCurrent: processedEmbeddable,
+				progressTotal: embeddableTotal,
+				metadata: {
+					...(sameQueuedSyncMemoryIds(latestMetadata, metadata)
+						? metadataAfterPrune
+						: latestMetadata),
+					removed_stale_rows:
+						Number(latestMetadata.removed_stale_rows ?? metadata.removed_stale_rows ?? 0) +
+						prunedCoveredRows,
+					last_cursor_id: lastCursorId,
+					processed_embeddable: processedEmbeddable,
+					embeddable_total: embeddableTotal,
+				},
+			});
+		}).immediate();
 		return;
 	}
 
 	if (metadata.last_cursor_id && metadata.last_cursor_id > 0) {
-		db.transaction(() => {
-			const removed = cleanupStaleModels(db, targetModel);
-			completeMaintenanceJob(db, VECTOR_MODEL_MIGRATION_JOB, {
-				message:
-					removed > 0
-						? `Finished re-indexing and removed ${removed} stale vector rows`
-						: "Finished re-indexing memories",
-				progressCurrent: embeddableTotal,
-				progressTotal: embeddableTotal,
-				metadata: {
-					...metadata,
-					removed_stale_rows: removed,
-					processed_embeddable: embeddableTotal,
-					embeddable_total: embeddableTotal,
-				},
-			});
-		})();
+		finalizeMigrationCutover(
+			db,
+			targetModel,
+			metadata,
+			metadata.last_cursor_id,
+			embeddableTotal,
+			embeddableTotal,
+			options.signal,
+		);
 	}
 }
 
@@ -678,10 +913,11 @@ export class VectorModelMigrationRunner {
 			// available again (all of which re-enter at full cadence on the
 			// next tick). Running/pending stay non-idle because work is in
 			// progress.
+			const meta = (job.metadata ?? {}) as MigrationMetadata;
 			if (job.status === "running" || job.status === "pending") {
+				if (Number(meta.cutover_retry_count ?? 0) > 0) return true;
 				return false;
 			}
-			const meta = (job.metadata ?? {}) as MigrationMetadata;
 			const queued =
 				metadataMemoryIds(meta.pending_upsert_memory_ids).length +
 				metadataMemoryIds(meta.pending_delete_memory_ids).length;
@@ -690,7 +926,10 @@ export class VectorModelMigrationRunner {
 		}
 		// No job row yet. Peek coverage directly to tell whether the first
 		// tick on a fresh DB genuinely had nothing to do.
-		const targetModel = resolveEmbeddingModel();
+		const embeddingModel = resolveEmbeddingModel();
+		const embeddingRevision = tryResolveEmbeddingRevision(embeddingModel);
+		if (!embeddingRevision) return true;
+		const targetModel = resolveEmbeddingVectorIdentityLabel(embeddingModel, embeddingRevision);
 		try {
 			const uncovered = db
 				.prepare(

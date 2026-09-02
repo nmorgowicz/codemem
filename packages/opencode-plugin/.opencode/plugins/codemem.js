@@ -34,6 +34,8 @@ const VIEWER_HEALTH_TIMEOUT_MS = 5_000;
 const VIEWER_HEALTH_RESTART_THRESHOLD = 3;
 const VIEWER_HEALTH_RESTART_COOLDOWN_MS = 5 * 60_000;
 const RAW_EVENTS_STATUS_TIMEOUT_MS = 5_000;
+const DEFAULT_EMBEDDING_MODEL = "Xenova/bge-small-en-v1.5";
+const DEFAULT_EMBEDDING_REVISION = "ea104dacec62c0de699686887e3f920caeb4f3e3";
 
 let compatCheckCache = null;
 const notifiedReleaseVersions = new Set();
@@ -632,6 +634,22 @@ const buildViewerIdentityTarget = (env = process.env, cwd = process.cwd()) => {
       : trimmed;
     return resolve(cwd, expanded);
   };
+  const embeddingModel = env.CODEMEM_EMBEDDING_MODEL || DEFAULT_EMBEDDING_MODEL;
+  const configuredEmbeddingRevision = env.CODEMEM_EMBEDDING_REVISION?.trim();
+  // Mirror core's tryResolveEmbeddingRevision exactly: a configured revision is
+  // used only when it is commit-addressed (7–40 hex); a mutable ref (branch/tag)
+  // is REJECTED and yields null even for the default model. The pinned default
+  // revision applies only when no revision was configured, so this identity
+  // target matches the viewer's instead of forcing the local CLI fallback.
+  let embeddingRevision;
+  if (configuredEmbeddingRevision) {
+    embeddingRevision = /^[0-9a-f]{7,40}$/.test(configuredEmbeddingRevision)
+      ? configuredEmbeddingRevision
+      : null;
+  } else {
+    embeddingRevision =
+      embeddingModel === DEFAULT_EMBEDDING_MODEL ? DEFAULT_EMBEDDING_REVISION : null;
+  }
   return {
     device_id: env.CODEMEM_DEVICE_ID?.trim() || null,
     actor_id_present: Object.hasOwn(env, "CODEMEM_ACTOR_ID"),
@@ -644,7 +662,8 @@ const buildViewerIdentityTarget = (env = process.env, cwd = process.cwd()) => {
     embedding_disabled: ["1", "true", "yes"].includes(
       String(env.CODEMEM_EMBEDDING_DISABLED || "").toLowerCase(),
     ),
-    embedding_model: env.CODEMEM_EMBEDDING_MODEL || "Xenova/bge-small-en-v1.5",
+    embedding_model: embeddingModel,
+    embedding_revision: embeddingRevision,
   };
 };
 

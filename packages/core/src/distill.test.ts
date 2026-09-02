@@ -14,7 +14,8 @@ import {
 	scoreDistillClusters,
 	selectDistillCorpus,
 } from "./distill.js";
-import { resolveEmbeddingModel, serializeFloat32 } from "./embeddings.js";
+import { resolveEmbeddingVectorIdentityLabel, serializeFloat32 } from "./embeddings.js";
+import { startMaintenanceJob } from "./maintenance-jobs.js";
 import { MemoryStore } from "./store.js";
 import { initTestSchema } from "./test-utils.js";
 
@@ -1781,17 +1782,75 @@ describe("distill", () => {
 				model TEXT
 			)`,
 		);
-		const currentModel = resolveEmbeddingModel();
+		const currentModel = resolveEmbeddingVectorIdentityLabel();
 		const insertVector = store.db.prepare(
 			"INSERT INTO memory_vectors(embedding, memory_id, chunk_index, content_hash, model) VALUES (?, ?, ?, ?, ?)",
 		);
 		insertVector.run(serializeFloat32(new Float32Array([100, 100])), id, 0, "old", "old-model");
 		insertVector.run(serializeFloat32(new Float32Array([1, 0])), id, 0, "current-a", currentModel);
 		insertVector.run(serializeFloat32(new Float32Array([0, 1])), id, 1, "current-b", currentModel);
+		startMaintenanceJob(store.db, {
+			kind: "vector_model_migration",
+			title: "Current model cutover",
+			status: "completed",
+			metadata: { source_model: "old-model", target_model: currentModel },
+		});
 
 		const [feature] = loadDistillVectorFeatures(store, [item]);
 
 		expect(feature?.vector).toEqual(new Float32Array([0.5, 0.5]));
+	});
+
+	it("prefers target vectors per memory during a compatible legacy rebuild", () => {
+		const sessionId = insertSession("codemem");
+		const now = "2026-06-01T00:00:01.000Z";
+		const insertMemory = store.db.prepare(
+			`INSERT INTO memory_items(
+				session_id, kind, title, body_text, active, created_at, updated_at, metadata_json, project
+			) VALUES (?, 'decision', ?, ?, 1, ?, ?, '{}', 'codemem')`,
+		);
+		const legacyOnly = Number(
+			insertMemory.run(sessionId, "Legacy only", "b", now, now).lastInsertRowid,
+		);
+		const targetOnly = Number(
+			insertMemory.run(sessionId, "Target only", "b", now, now).lastInsertRowid,
+		);
+		const both = Number(insertMemory.run(sessionId, "Both", "b", now, now).lastInsertRowid);
+
+		store.db.exec("DROP TABLE IF EXISTS memory_vectors");
+		store.db.exec(
+			`CREATE TABLE memory_vectors(
+				embedding BLOB,
+				memory_id INTEGER,
+				chunk_index INTEGER,
+				content_hash TEXT,
+				model TEXT
+			)`,
+		);
+		const legacyModel = "Xenova/bge-small-en-v1.5";
+		const targetModel = resolveEmbeddingVectorIdentityLabel();
+		const insertVector = store.db.prepare(
+			"INSERT INTO memory_vectors(embedding, memory_id, chunk_index, content_hash, model) VALUES (?, ?, ?, ?, ?)",
+		);
+		// No completed cutover job: search serves the compatible legacy corpus,
+		// but new memories exist only under the revision-aware target identity.
+		insertVector.run(serializeFloat32(new Float32Array([1, 0])), legacyOnly, 0, "l", legacyModel);
+		insertVector.run(serializeFloat32(new Float32Array([0, 1])), targetOnly, 0, "t", targetModel);
+		insertVector.run(serializeFloat32(new Float32Array([9, 9])), both, 0, "b-legacy", legacyModel);
+		insertVector.run(serializeFloat32(new Float32Array([0, 1])), both, 0, "b-target", targetModel);
+
+		const items = [store.get(legacyOnly), store.get(targetOnly), store.get(both)].filter(
+			(item): item is NonNullable<typeof item> => item != null,
+		);
+		const byId = new Map(
+			loadDistillVectorFeatures(store, items).map((feature) => [feature.memory_id, feature.vector]),
+		);
+
+		expect(byId.get(legacyOnly)).toEqual(new Float32Array([1, 0]));
+		expect(byId.get(targetOnly)).toEqual(new Float32Array([0, 1]));
+		// The memory present in both corpora must use only its target vectors,
+		// not an average that pulls in the stale legacy chunk.
+		expect(byId.get(both)).toEqual(new Float32Array([0, 1]));
 	});
 
 	it("chunks vector lookup for large distill corpora", () => {
@@ -1818,7 +1877,7 @@ describe("distill", () => {
 				model TEXT
 			)`,
 		);
-		const currentModel = resolveEmbeddingModel();
+		const currentModel = resolveEmbeddingVectorIdentityLabel();
 		const insertVector = store.db.prepare(
 			"INSERT INTO memory_vectors(embedding, memory_id, chunk_index, content_hash, model) VALUES (?, ?, ?, ?, ?)",
 		);

@@ -394,7 +394,7 @@ For cross-network setups where peer addresses change frequently or mDNS does not
 
 ## Semantic recall
 
-Embeddings are stored in sqlite-vec and written automatically when memories are created. Use `codemem embed` to backfill existing memories. If sqlite-vec cannot load, keyword search still works.
+Embeddings are stored in sqlite-vec and written automatically when memories are created. Use `codemem embed` to backfill existing memories. The semantic runtime rejects a custom `CODEMEM_EMBEDDING_MODEL` without an explicit immutable `CODEMEM_EMBEDDING_REVISION`; status, hooks, and keyword search remain available. Changing either value triggers a background rebuild and uses keyword search until incompatible migrations finish. If sqlite-vec cannot load, keyword search still works.
 
 ## Alternative install methods
 

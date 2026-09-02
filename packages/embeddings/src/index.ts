@@ -1,10 +1,22 @@
 export interface EmbeddingRuntimeRequest {
 	model: string;
+	revision?: string;
+}
+
+export interface EmbeddingRuntimeIdentity {
+	readonly package: "@huggingface/transformers";
+	readonly version: string;
+	readonly model: string;
+	readonly revision: string;
+	readonly dtype: "fp32";
+	readonly device: "cpu";
+	readonly dimensions: number;
 }
 
 export interface EmbeddingClient {
 	readonly model: string;
 	readonly dimensions: number;
+	readonly identity: EmbeddingRuntimeIdentity;
 	embed(texts: string[]): Promise<Float32Array[]>;
 }
 
@@ -21,6 +33,9 @@ type Extractor = (
 	texts: string[],
 	options: { pooling: "mean"; normalize: true },
 ) => Promise<Tensor>;
+
+const DEFAULT_MODEL = "Xenova/bge-small-en-v1.5";
+const DEFAULT_REVISION = "ea104dacec62c0de699686887e3f920caeb4f3e3";
 
 function rows(output: Tensor, count: number, dimensions: number): Float32Array[] {
 	if (
@@ -46,11 +61,19 @@ function rows(output: Tensor, count: number, dimensions: number): Float32Array[]
 
 export async function createEmbeddingRuntime({
 	model,
+	revision: requestedRevision,
 }: EmbeddingRuntimeRequest): Promise<EmbeddingClient> {
-	const { pipeline } = await import("@xenova/transformers");
+	const configuredRevision = requestedRevision?.trim();
+	if (model !== DEFAULT_MODEL && !configuredRevision) {
+		throw new TypeError("A revision is required when creating a runtime for a custom model");
+	}
+	const revision = configuredRevision || DEFAULT_REVISION;
+	const { pipeline } = await import("@huggingface/transformers");
 	// Runtime validation below guards the structural boundary hidden by upstream's broad pipeline type.
 	const extractor = (await pipeline("feature-extraction", model, {
-		quantized: false,
+		revision,
+		device: "cpu",
+		dtype: "fp32",
 	})) as unknown as Extractor;
 	const options = { pooling: "mean", normalize: true } as const;
 	const probe = await extractor(["probe"], options);
@@ -63,6 +86,15 @@ export async function createEmbeddingRuntime({
 	return {
 		model,
 		dimensions,
+		identity: {
+			package: "@huggingface/transformers",
+			version: "4.2.0",
+			model,
+			revision,
+			dtype: "fp32",
+			device: "cpu",
+			dimensions,
+		},
 		async embed(texts) {
 			const result: Float32Array[] = [];
 			for (let offset = 0; offset < texts.length; offset += 32) {

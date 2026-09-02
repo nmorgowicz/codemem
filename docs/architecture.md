@@ -118,9 +118,24 @@ It does not currently gate sync or retrieval. See `docs/plans/2026-03-08-shared-
 
 When the optional `@codemem/embeddings` runtime is installed, `memory_vectors` (a `vec0` virtual table from sqlite-vec) stores 384-dimensional float vectors keyed by `memory_id`. Vectors are written automatically when memories are created, or backfilled with `codemem embed`. Lexical-only installs omit Transformers and ONNX Runtime.
 
+Each vector row carries a canonical identity for model repository, revision,
+runtime generation, fp32 dtype, mean pooling, L2 normalization, and dimensions.
+The default label is about 154 bytes, roughly 130 bytes more than the former
+bare-model label per vector row, plus SQLite storage overhead. Runtime package
+version is diagnostic metadata and does not change vector compatibility by
+itself.
+
+The v4 rollout builds a revision-aware corpus in the background and deletes the
+legacy corpus only during the completed-coverage cutover transaction. Semantic
+search may keep using the measured-compatible legacy default corpus during that
+one migration; every other source/target change falls back to FTS5 until
+cutover. Custom model repositories require an explicit immutable
+`CODEMEM_EMBEDDING_REVISION` for semantic runtime initialization; identity and
+FTS-only paths retain the unresolved revision as `null` instead of failing.
+
 Semantic search embeds the query text, then runs a nearest-neighbor lookup against `memory_vectors`. Distance is converted to a similarity score: `1.0 / (1.0 + distance)`.
 
-If sqlite-vec can't load (e.g., missing native extension), semantic search is silently skipped and keyword search still works.
+If sqlite-vec or the optional embedding runtime cannot load, Codemem warns once per process and continues with keyword search.
 
 ### Hybrid merge and re-rank (pack path)
 
