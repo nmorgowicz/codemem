@@ -623,7 +623,15 @@ try {
 	assert(existsSync(lexicalLockPath), "Lexical install did not produce a package-lock.json");
 	const lexicalLock = JSON.parse(readFileSync(lexicalLockPath, "utf8"));
 	const lexicalPackages = Object.keys(lexicalLock.packages ?? {});
-	for (const packageName of ["@codemem/embeddings", "@xenova/transformers", "onnxruntime-node"]) {
+	for (const packageName of [
+		"@codemem/embeddings",
+		"@huggingface/transformers",
+		"@xenova/transformers",
+		"onnxruntime-common",
+		"onnxruntime-node",
+		"onnxruntime-web",
+		"sharp",
+	]) {
 		assert(
 			// npm lockfile package keys use `/` and may be relative to a parent directory.
 			!lexicalPackages.some((path) => path.endsWith(`node_modules/${packageName}`)),
@@ -636,6 +644,14 @@ try {
 		...process.env,
 		ONNXRUNTIME_NODE_INSTALL: "skip",
 	});
+	const semanticLockPath = join(semanticInstallDir, "package-lock.json");
+	assert(existsSync(semanticLockPath), "Semantic install did not produce a package-lock.json");
+	const semanticLock = JSON.parse(readFileSync(semanticLockPath, "utf8"));
+	const semanticPackages = Object.keys(semanticLock.packages ?? {});
+	assert(
+		semanticPackages.some((path) => path.endsWith("node_modules/@huggingface/transformers")),
+		"Semantic install is missing the @huggingface/transformers runtime",
+	);
 	const ortBinaryDir = join(
 		semanticInstallDir,
 		"node_modules",
@@ -667,6 +683,10 @@ try {
 		),
 		"CPU-only semantic install unexpectedly contains the ONNX Runtime CUDA provider",
 	);
+	// Importing the @codemem/embeddings wrapper is always safe: it loads
+	// Transformers.js (and thus onnxruntime-node) lazily inside
+	// createEmbeddingRuntime, so this verifies the packed export exists even on
+	// Intel macOS where the ORT CPU binary is unavailable.
 	run(
 		process.execPath,
 		[
@@ -676,6 +696,19 @@ try {
 		],
 		semanticInstallDir,
 	);
+	// Only evaluate the direct Transformers.js runtime where ORT has a CPU binary;
+	// on darwin/x64 that import cannot load onnxruntime-node.
+	if (supportsOrtCpuBinary) {
+		run(
+			process.execPath,
+			[
+				"--input-type=module",
+				"--eval",
+				"const transformers = await import('@huggingface/transformers'); if (typeof transformers.pipeline !== 'function') process.exit(1);",
+			],
+			semanticInstallDir,
+		);
+	}
 
 	const installedPackageRoot = join(installDir, "node_modules", "codemem");
 	const cliBin = join(installDir, "node_modules", ".bin", process.platform === "win32" ? "codemem.cmd" : "codemem");
