@@ -30,11 +30,11 @@ function fail(message, result) {
 	throw new Error(message);
 }
 
-function run(command, args, cwd = packageRoot) {
+function run(command, args, cwd = packageRoot, env = process.env) {
 	const result = spawnSync(command, args, {
 		cwd,
 		encoding: "utf8",
-		env: process.env,
+		env,
 	});
 	if (result.status !== 0) {
 		fail(`Command failed: ${command} ${args.join(" ")}`, result);
@@ -632,7 +632,41 @@ try {
 	}
 
 	const semanticInstallDir = join(tempDir, "semantic-install");
-	run("npm", ["install", "--prefix", semanticInstallDir, coreTarball, embeddingsTarball]);
+	run("npm", ["install", "--prefix", semanticInstallDir, coreTarball, embeddingsTarball], packageRoot, {
+		...process.env,
+		ONNXRUNTIME_NODE_INSTALL: "skip",
+	});
+	const ortBinaryDir = join(
+		semanticInstallDir,
+		"node_modules",
+		"onnxruntime-node",
+		"bin",
+		"napi-v6",
+		process.platform,
+		process.arch,
+	);
+	const supportsOrtCpuBinary = !(process.platform === "darwin" && process.arch === "x64");
+	if (supportsOrtCpuBinary) {
+		assert(
+			existsSync(join(ortBinaryDir, "onnxruntime_binding.node")),
+			`Semantic install is missing ONNX Runtime CPU binaries for ${process.platform}/${process.arch}`,
+		);
+	}
+	assert(
+		!existsSync(
+			join(
+				semanticInstallDir,
+				"node_modules",
+				"onnxruntime-node",
+				"bin",
+				"napi-v6",
+				"linux",
+				"x64",
+				"libonnxruntime_providers_cuda.so",
+			),
+		),
+		"CPU-only semantic install unexpectedly contains the ONNX Runtime CUDA provider",
+	);
 	run(
 		process.execPath,
 		[

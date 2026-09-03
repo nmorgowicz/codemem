@@ -54,7 +54,7 @@ On Linux, skip the unused ONNX Runtime GPU provider download:
 env ONNXRUNTIME_NODE_INSTALL=skip npm install -g codemem @codemem/embeddings
 ```
 
-On macOS and Windows:
+On Apple silicon macOS and Windows, install both packages normally:
 
 ```text
 npm install -g codemem @codemem/embeddings
@@ -62,6 +62,13 @@ npm install -g codemem @codemem/embeddings
 
 Installing only `codemem` keeps the CLI functional with FTS5 keyword retrieval
 and does not download the embedding runtime.
+
+Setup-managed `npx` launchers (used when `codemem` is not installed globally) do
+not set `ONNXRUNTIME_NODE_INSTALL=skip`. On Linux with a package manager that
+runs dependency lifecycle scripts, the first `npx` resolution can still download
+the unused ONNX Runtime GPU provider. Linux users on the no-global-install path
+should either install both packages globally with the CPU-only policy above, or
+set `ONNXRUNTIME_NODE_INSTALL=skip` persistently in their environment.
 
 After upgrading an existing installation, rerun `codemem setup` (or the
 app-specific `--opencode-only`, `--claude-only`, or `--codex-only` form).
@@ -77,6 +84,8 @@ plus any running `codemem serve` process. Each MCP process caches runtime
 availability for its lifetime, so a still-running Claude or Codex MCP host keeps
 lexical-only recall until it restarts; restarting `codemem serve` alone does not
 restart that MCP child.
+
+The semantic runtime is pinned to CPU inference on every platform.
 
 OpenCode plugin and CLI are now split intentionally:
 
