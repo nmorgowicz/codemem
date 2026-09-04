@@ -1,0 +1,12 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugin": [
+    [
+      "./packages/opencode-plugin/src/lint-feedback.ts",
+      {
+        "command": ["pnpm", "exec", "biome", "lint", "--reporter=json"],
+        "timeoutMs": 10000
+      }
+    ]
+  ]
+}

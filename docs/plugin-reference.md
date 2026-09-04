@@ -14,6 +14,12 @@ This page covers advanced plugin behavior, environment variables, and stream rel
 4. Use `codemem stats` and `codemem recent` to confirm ingestion.
 5. Browse the viewer at the printed URL.
 
+### Repository-only lint feedback
+
+When OpenCode runs from a codemem source checkout, the root `opencode.jsonc` loads `packages/opencode-plugin/src/lint-feedback.ts` with an explicit `pnpm exec biome lint --reporter=json` command. The hook checks JavaScript and TypeScript paths handled by `edit`, `write`, or `apply_patch`, including move destinations; it appends at most 10 new or worsened diagnostics and leaves the edit intact when Biome fails or exceeds its 10-second timeout. Existing diagnostics are a warning-level ratchet rather than a cleanup mandate.
+
+This hook is contributor tooling only. Neither the root OpenCode config nor `src/lint-feedback.ts` is included in the published `@codemem/opencode-plugin` package, so installing codemem does not activate it. Restart OpenCode after changing the checkout's plugin configuration.
+
 OpenCode prompt-time pack construction and prompt-pack ledger transitions use the
 long-lived local viewer first. Retryable connection, timeout, endpoint-version,
 server, or malformed-response failures fall back to the compatible CLI path.
